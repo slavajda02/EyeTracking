@@ -13,6 +13,8 @@ import argparse
 import sqlite3
 import base64
 from io import BytesIO
+import tempfile
+import shutil
 
 import numpy as np
 from PIL import Image
@@ -21,9 +23,10 @@ import tensorflow as tf
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import InputLayer, Conv2D, MaxPooling2D, Flatten, Dense, Dropout
 from tensorflow.keras.regularizers import l2
+from tqdm import tqdm
 
 # Global configuration constants.
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 IMAGE_SIZE = 128       # Size to resize each eye image (width and height).
 MAX_OFFSET = 10        # Maximum pixel offset for on-the-fly augmentation.
 DEFAULT_LIMIT = 25000  # Default limit on the number of rows to query from the database.
@@ -129,6 +132,7 @@ def load_data_from_db(db_path: str) -> tuple:
         ORDER BY RANDOM()
         LIMIT {DEFAULT_LIMIT}
     """
+    print(f'Loading data from: {db_path}')
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute(query)
@@ -138,7 +142,7 @@ def load_data_from_db(db_path: str) -> tuple:
     combined_images = []
     labels = []
     target_size = (IMAGE_SIZE, IMAGE_SIZE)
-    for left_frame, right_frame, openness in rows:
+    for left_frame, right_frame, openness in tqdm(rows):
         try:
             left_img = preprocess_eye(left_frame, size=target_size)
             right_img = preprocess_eye(right_frame, size=target_size)
@@ -154,6 +158,156 @@ def load_data_from_db(db_path: str) -> tuple:
         labels.append([openness])
 
     return np.array(combined_images), np.array(labels)
+
+def create_relabeling_dataset(data_dir: str, batch_size: int = BATCH_SIZE) -> tf.data.Dataset:
+    """
+    Create a TensorFlow dataset without shuffling for relabeling using the preprocessed images and labels.
+
+    Parameters:
+        data_dir (str): Path to the directory containing images and labels.
+        batch_size (int): Batch size for the dataset.
+
+    Returns:
+        tf.data.Dataset: A TensorFlow dataset ready for training.
+    """
+    images_dir = os.path.join(data_dir, "images")
+    labels_path = os.path.join(data_dir, "labels.npy")
+
+    # Load labels
+    labels = np.load(labels_path)
+
+    # Create a dataset of file paths
+    image_files = [os.path.join(images_dir, f) for f in sorted(os.listdir(images_dir), key=lambda x: int(x.split('_')[1].split('.')[0]))]
+    dataset = tf.data.Dataset.from_tensor_slices(image_files)
+
+    # Load and preprocess images
+    def load_image(image_path):
+        def load_and_cast(image_path):
+            image = np.load(image_path.decode("utf-8"))  # Load the .npy file
+            return image.astype(np.float32)  # Explicitly cast to float32
+
+        image = tf.numpy_function(load_and_cast, [image_path], tf.float32)
+        return image
+
+    dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+    # Batch the dataset
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return dataset
+
+def relable_dataset(model: tf.keras.Model, dataset: tf.data.Dataset) -> np.ndarray:
+    """
+    Relabel the dataset using the provided model.
+
+    Parameters:
+        model (tf.keras.Model): The model to use for relabeling.
+        dataset (tf.data.Dataset): The dataset containing unshufled images without labels.
+
+    Returns:
+        np.ndarray: relabeled labels.
+    """
+    # Predict the labels using the model.
+    predictions = model.predict(dataset, verbose=1)
+    
+    # Compute the 5th and 95th percentiles of the predictions.
+    labels_flat = predictions.flatten()
+    p5 = np.percentile(labels_flat, 5)
+    p95 = np.percentile(labels_flat, 95)
+
+    # Scale the predictions linearly so that the 5th percentile maps to 0 and the 95th to 0.75.
+    new_training_labels_scaled = (predictions - p5) / (p95 - p5) * 0.75
+
+    # Clip the scaled labels to be within [0, 0.75].
+    new_training_labels_scaled = np.clip(new_training_labels_scaled, 0.0, 0.75)
+    
+    return new_training_labels_scaled
+
+def preprocess_and_save_to_disk(model, db_path: str, output_dir: str) -> str:
+    """
+    Loads images from a database, applies offset augmentation relabels using an existing model
+    and saves the images and labels as a .npy to a specified path.
+    These files can then be used by the dataset loader.
+
+    Parameters:
+        model (tf.keras.Model): The existing model to use for relabeling.
+        db_path (str): Path to the SQLite database file.
+        output_dir (str): Directory to save the preprocessed images and labels.
+
+    Returns:
+        str: Path to the directory containing the saved images and labels.
+    """
+    images_path = os.path.join(output_dir, "images")
+    labels_path = os.path.join(output_dir, "labels.npy")
+    os.makedirs(images_path, exist_ok=True)
+    
+    # Load images and labels from the database
+    combined_images, labels = load_data_from_db(db_path)
+    
+    # Save the images and  new labels to disk
+    print("Saving preprocessed images and labels to disk...")
+    for idx, combined_img in enumerate(tqdm(combined_images)):
+        image_path = os.path.join(images_path, f"image_{idx}.npy")
+        np.save(image_path, combined_img)
+    np.save(labels_path, labels)
+    
+    # Use the model to predict the labels for the combined images.
+    print("Relabeling training data using the loaded model...")
+    relabeling_dataset = create_relabeling_dataset(output_dir)
+    new_labels = relable_dataset(model, relabeling_dataset)
+    print("Saving new labels to disk...")
+    np.save(labels_path, new_labels)
+    
+    return output_dir
+
+def create_tf_dataset(data_dir: str, batch_size: int = BATCH_SIZE, validation_split: float = 0.1) -> tuple:
+    """
+    Create TensorFlow datasets for training and validation from preprocessed images and labels.
+    Used to reduce RAM usage.
+
+    Parameters:
+        data_dir (str): Path to the directory containing images and labels.
+        batch_size (int): Batch size for the dataset.
+        validation_split (float): Fraction of the dataset to use for validation.
+
+    Returns:
+        tuple: A tuple containing:
+            - tf.data.Dataset: Training dataset.
+            - tf.data.Dataset: Validation dataset.
+    """
+    images_dir = os.path.join(data_dir, "images")
+    labels_path = os.path.join(data_dir, "labels.npy")
+
+    # Load labels
+    labels = np.load(labels_path)
+
+    # Create a dataset of file paths
+    image_files = [os.path.join(images_dir, f) for f in sorted(os.listdir(images_dir), key=lambda x: int(x.split('_')[1].split('.')[0]))]
+    dataset = tf.data.Dataset.from_tensor_slices((image_files, labels))
+
+    # Load and preprocess images
+    def load_image(image_path, label):
+        def load_and_cast(image_path):
+            image = np.load(image_path.decode("utf-8"))  # Load the .npy file
+            return image.astype(np.float32)  # Explicitly cast to float32
+
+        image = tf.numpy_function(load_and_cast, [image_path], tf.float32)
+        return image, label
+
+    dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Shuffle and split the dataset
+    dataset_size = len(image_files)
+    val_size = int(dataset_size * validation_split)
+    train_size = dataset_size - val_size
+
+    train_dataset = dataset.take(train_size)
+    val_dataset = dataset.skip(train_size)
+
+    # Batch and prefetch the datasets
+    train_dataset = train_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return train_dataset, val_dataset
 
 def build_model() -> tf.keras.Model:
     """
@@ -186,9 +340,6 @@ def build_model() -> tf.keras.Model:
 
 
 def main():
-    """
-    Main function to load data, relabel using an existing model, train a new model, and save it.
-    """
     parser = argparse.ArgumentParser(
         description="Retrain Combined Eye Openness Model using a pre-existing model for relabeling"
     )
@@ -210,36 +361,22 @@ def main():
     if not os.path.isdir(output_dir):
         print("Output directory not found. Exiting.")
         return
-
-    # Determine the output path for the new model.
-    new_model_path = os.path.join(output_dir, "combined_openness_gen2.h5")
-
-    # Load training data.
-    print("Loading training data from:", db_path)
-    images, labels = load_data_from_db(db_path)
-    print("Images shape:", images.shape, "Labels shape:", labels.shape)
-
-    # Load the existing model.
+    
+    # Load the existing model
     print("Loading existing model from:", input_model_path)
-    loaded_model = tf.keras.models.load_model(input_model_path)
+    loaded_model = tf.keras.models.load_model(input_model_path, custom_objects={'mse': tf.keras.losses.MeanSquaredError()})
     loaded_model.summary()
+    
+    # Get directory in the system temp folder to save data to
+    temp_dir = tempfile.mkdtemp()
+    print("Preprocessing and saving data to:", temp_dir)
+    data_dir = preprocess_and_save_to_disk(loaded_model, db_path, temp_dir)
+    print("Data loaded, relabeled and saved.")
 
-    # Relabel training data using the loaded model.
-    print("Relabeling training data using the loaded model...")
-    predictions = loaded_model.predict(images, batch_size=BATCH_SIZE)
+    # Create TensorFlow datasets
+    train_dataset, val_dataset = create_tf_dataset(data_dir)
 
-    # Compute the 5th and 95th percentiles of the predictions.
-    labels_flat = predictions.flatten()
-    p5 = np.percentile(labels_flat, 5)
-    p95 = np.percentile(labels_flat, 95)
-
-    # Scale the predictions linearly so that the 5th percentile maps to 0 and the 95th to 0.75.
-    new_training_labels_scaled = (predictions - p5) / (p95 - p5) * 0.75
-
-    # Clip the scaled labels to be within [0, 0.75].
-    new_training_labels_scaled = np.clip(new_training_labels_scaled, 0.0, 0.75)
-
-    # Build and train the new model.
+    # Build and train the new model
     print("Building and training new model on relabeled data...")
     new_model = build_model()
     new_model.summary()
@@ -252,15 +389,17 @@ def main():
     )
 
     new_model.fit(
-        images, new_training_labels_scaled,
+        train_dataset,
+        validation_data=val_dataset,
         epochs=250,
-        batch_size=BATCH_SIZE,
-        validation_split=0.1,
         callbacks=[lr_scheduler, early_stopping]
     )
 
+    new_model_path = os.path.join(output_dir, "combined_openness_gen2.h5")
     new_model.save(new_model_path)
     print("New model saved to", new_model_path)
-
-if __name__ == '__main__':
-    main()
+    
+    #Remove the tmp directory
+    print(f'Removing temp directory {temp_dir}')
+    shutil.rmtree(temp_dir)
+    print("Done!")
